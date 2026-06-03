@@ -1,5 +1,6 @@
 import copy
 import os
+import tempfile
 
 import gymnasium as gym
 import matplotlib.pyplot as plt
@@ -9,7 +10,6 @@ from gymnasium import spaces
 from rocketpy import (
     Environment,
     Flight,
-    Function,
     LinearGenericSurface,
     MonteCarlo,
     Rocket,
@@ -18,13 +18,13 @@ from rocketpy import (
     StochasticFlight,
     StochasticRocket,
 )
+from rocketpy.mathutils.vector_matrix import Matrix, Vector
 from rocketpy.motors import CylindricalTank, Fluid, HybridMotor
 from rocketpy.motors.tank import MassFlowRateBasedTank
 from rocketpy.sensors.accelerometer import Accelerometer
 from rocketpy.sensors.gnss_receiver import GnssReceiver
 from rocketpy.sensors.gyroscope import Gyroscope
 from rocketpy.tools import euler313_to_quaternions
-from vpython import arrow, canvas, color, rate, sphere, vector
 
 
 class BalloonPoppingEnv(gym.Env):
@@ -38,6 +38,12 @@ class BalloonPoppingEnv(gym.Env):
         self.balloon_parameters = parameters["balloon"]
         self.rocket_parameters = parameters["rocket"]
 
+        # ActiveRocketPy flight classes for rocket flight and balloon flights
+        self._rocket_flight = None
+        self._balloon_flights = None
+
+        # initial solution: [time, x, y, z, vx, vy, vz, e0, e1, e2, e3, w1, w2, w3]
+        self.initial_solution = None
         # [balloon_num, status] status: 0-ground; 1-released; 2-popped
         self._balloon_status = np.zeros((self.balloon_parameters["num"], 1), dtype=int)
         # [balloon_num, (x, y, z, vx, vy, vz)]
@@ -46,6 +52,17 @@ class BalloonPoppingEnv(gym.Env):
         self._rocket_sensors = np.full(12, np.nan)
         # (posX, posY, posZ, velX, velY, velZ, e0, e1, e2, e3, w1, w2, w3)
         self._rocket_states = np.full(13, np.nan)
+        # save trajectories for logging
+        self.trajectories = None
+
+        # attributes for step()
+        self.rocket_launched = False
+        self.current_step = 0
+        self.num_timesteps = 0
+        self._popped_count = 0
+        self._balloon_release_at_step = None
+
+        self._rocketpy_env = None
 
         # Observations include balloon and rocket states
         self.observation_space = spaces.Dict(
@@ -102,9 +119,6 @@ class BalloonPoppingEnv(gym.Env):
             }
         )
 
-        # Create ActiveRocketPy environment for balloon flights and rocket simulation
-        self.__create_environment()
-
         # Graphics-related attributes
         assert render_mode is None or render_mode in self.metadata["render_modes"]
         self.render_mode = render_mode
@@ -124,40 +138,43 @@ class BalloonPoppingEnv(gym.Env):
     def _get_info(self):
         return {
             "rocket_states": self._rocket_states,
+            "popped_count": self._popped_count,
         }
 
     def reset(self, seed=None, options=None):
         # We need the following line to seed self.np_random
         super().reset(seed=seed)
 
+        # Create ActiveRocketPy environment for balloon flights and rocket simulation
+        self.__create_environment()
+        self._rocket_flight = None
+        self._balloon_flights = None
+        self.initial_solution = None
+
         # Generate balloon release sequences for all balloons
         self.__reset_balloon_release_sequence()
-        self.__generate_balloon_flights()
 
-        # Scenario 0: hello world with static balloons
+        # Scenario 0: hello world with static balloons -- no Monte Carlo needed
         if self.scenario_parameters["number"] == 0:
+            self.__generate_static_balloon_flights()
             self._balloon_status = np.ones(
                 (self.balloon_parameters["num"], 1), dtype=int
             )
-            num_balloons = self._balloon_flights.shape[0]
-
-            # Spaced 40 m apart
-            z_values = 10 + self._rocketpy_env.elevation + np.arange(num_balloons) * 40
-            # x, y, vx, vy, vz = 0 for static balloons
-            self._balloon_flights[:, [0, 1, 3, 4, 5], :] = 0
-            # z = constant per balloon
-            self._balloon_flights[:, 2, :] = z_values[:, None]
         else:
+            self.__generate_balloon_flights()
             self._balloon_status = np.zeros(
                 (self.balloon_parameters["num"], 1), dtype=int
             )
 
+        self._balloon_states = self._balloon_flights[:, :, 0]
+        self._rocket_sensors = np.full(12, np.nan)
+        self._rocket_states = np.full(13, np.nan)
+        self.trajectories = None
+
         self.rocket_launched = False
         self.current_step = 0
         self.num_timesteps = self._balloon_flights.shape[2]
-        self._balloon_states = self._balloon_flights[:, :, self.current_step]
-        self._rocket_sensors = np.full(12, np.nan)
-        self._rocket_states = np.full(13, np.nan)
+        self._popped_count = 0
 
         observation = self._get_obs()
         info = self._get_info()
@@ -210,20 +227,38 @@ class BalloonPoppingEnv(gym.Env):
             # detect pops
             self._detect_pops(previous_balloon_positions, previous_rocket_position)
 
+        # Append rocket and balloon states to trajectories for logging
+        step_record = {
+            "time": self.current_step * self.simulation_parameters["time_step"],
+            "rocket_states": self._rocket_states.copy().tolist(),
+            "balloon_states": self._balloon_states.copy().tolist(),
+            "balloon_status": self._balloon_status[:, 0].tolist(),
+        }        
+        if self.trajectories is None:
+            self.trajectories = [step_record]
+        else:
+            self.trajectories.append(step_record)
+
         # An episode is done iff reaches max time or end of trajectory
         _timeout = self.current_step >= self.num_timesteps - 1
         if _timeout:
-            print(f"Terminated: Reached max time")
+            print("Terminated: Reached max time")
             self._rocket_flight.post_process_simulation()
             self._rocket_flight.initialize_prints_plots()
         elif _rocket_finished:
-            print(f"Terminated: Rocket flight finished")
+            print("Terminated: Rocket flight finished")
         terminated = _timeout or _rocket_finished
 
-        reward = np.sum(self._balloon_status[:, 0] == 2)
+        # Calculate reward based on newly popped balloons at this step
+        new_count = np.sum(self._balloon_status[:, 0] == 2)
+        reward = new_count - self._popped_count
+        self._popped_count = new_count
+
+        # Get observation and info for the current step
         observation = self._get_obs()
         info = self._get_info()
 
+        # Render every 0.1 sec or on termination to balance visualization and performance
         _remainder = np.remainder(
             self.current_step, 0.1 / self.simulation_parameters["time_step"]
         )  # print every 0.1 sec
@@ -339,6 +374,8 @@ class BalloonPoppingEnv(gym.Env):
 
     def _render_frame(self):
         if self.render_mode == "vpython":
+            from vpython import arrow, canvas, color, rate, sphere, vector
+
             if self.render_canvas is None:
                 self.render_canvas = canvas(
                     title="Balloon Popping Environment",
@@ -347,15 +384,44 @@ class BalloonPoppingEnv(gym.Env):
                     center=vector(0, 0, 0),
                     background=color.white,
                 )
-                self.render_balloons = sphere(
-                    radius=1.5, color=color.magenta, make_trail=True
+                self.render_balloons = [
+                    sphere(radius=1.5, color=color.magenta)
+                    for _ in range(self.balloon_parameters["num"])
+                ]
+                # Create rocket arrow visualization
+                self.render_rocket = arrow(
+                    pos=vector(0, 0, 0),
+                    axis=vector(0, 0, 5),
+                    shaftwidth=0.5,
+                    color=color.blue,
                 )
 
-            self.render_balloons.pos = vector(
-                self._balloon_states[0, 0],
-                self._balloon_states[0, 1],
-                self._balloon_states[0, 2],
-            )
+            # Status colors: 0=grey (ground), 1=magenta (released), 2=red (popped)
+            status_colors = {0: color.gray(0.5), 1: color.magenta, 2: color.red}
+            for balloon, state, status in zip(
+                self.render_balloons, self._balloon_states, self._balloon_status[:, 0]
+            ):
+                balloon.pos = vector(state[0], state[1], state[2])
+                balloon.color = status_colors[int(status)]
+
+            # Update rocket visualization with attitude
+            if not np.isnan(self._rocket_states[0]):
+                # Convert quaternion to rocket nose direction vector
+                nose_direction = Matrix.transformation(
+                    self._rocket_states[6:10]
+                ) @ Vector([0, 0, 1])
+
+                self.render_rocket.pos = vector(
+                    self._rocket_states[0],
+                    self._rocket_states[1],
+                    self._rocket_states[2],
+                )
+                self.render_rocket.axis = vector(
+                    nose_direction[0] * 10,
+                    nose_direction[1] * 10,
+                    nose_direction[2] * 10,
+                )
+
             rate(30)
         elif self.render_mode == "matplotlib":
             if self.render_canvas is None:
@@ -404,7 +470,7 @@ class BalloonPoppingEnv(gym.Env):
             )
             self.render_rocket[0].set_3d_properties([self._rocket_states[2]])
             self.render_canvas.set_title(
-                f"Time: {self.current_step * self.simulation_parameters['time_step']:.2f} sec\nReward: {np.sum(self._balloon_status[:, 0] == 2)}"
+                f"Time: {self.current_step * self.simulation_parameters['time_step']:.2f} sec\nTotal Reward: {self._popped_count}"
             )
             plt.draw()
             plt.pause(0.001)
@@ -436,6 +502,47 @@ class BalloonPoppingEnv(gym.Env):
                 file=path,
                 dictionary="ECMWF",
             )
+
+        # Add gust after setting atmospheric model.
+        if self.environment_parameters["gust"]["enable"]:
+            gust_param = self.environment_parameters["gust"]
+
+            altitude_nodes = np.arange(
+                0.0,
+                self._rocketpy_env.max_expected_height + gust_param["altitude_spacing"],
+                gust_param["altitude_spacing"],
+            )
+            x_gust_nodes = self.np_random.uniform(
+                -gust_param["max_gust_speed"],
+                gust_param["max_gust_speed"],
+                size=len(altitude_nodes),
+            )
+            y_gust_nodes = self.np_random.uniform(
+                -gust_param["max_gust_speed"],
+                gust_param["max_gust_speed"],
+                size=len(altitude_nodes),
+            )
+            gust_decay = np.exp(
+                -altitude_nodes / gust_param["gust_decay_height"]
+            )  # Exponential decay of gust speed with altitude
+
+            def gust_x(height_asl):
+                # X direction = East
+                return np.interp(
+                    height_asl,
+                    altitude_nodes,
+                    x_gust_nodes * gust_decay,
+                )
+
+            def gust_y(height_asl):
+                # Y direction = North
+                return np.interp(
+                    height_asl,
+                    altitude_nodes,
+                    y_gust_nodes * gust_decay,
+                )
+
+            self._rocketpy_env.add_wind_gust(gust_x, gust_y)
 
     def __reset_balloon_release_sequence(self):
         n = self.balloon_parameters["num"]
@@ -551,9 +658,7 @@ class BalloonPoppingEnv(gym.Env):
             self.simulation_parameters["time_step"],
         )
         monte_carlo_sim = MonteCarlo(
-            filename=os.path.join(
-                os.path.dirname(os.path.abspath(__file__)), "data", "balloon_sim"
-            ),
+            filename=os.path.join(tempfile.gettempdir(), f"balloon_sim_{os.getpid()}"),
             environment=stochastic_env,
             rocket=stochastic_balloon,
             flight=stochastic_flight,
@@ -574,11 +679,11 @@ class BalloonPoppingEnv(gym.Env):
             number_of_simulations=self.balloon_parameters["num"],
             append=False,
             include_function_data=False,
-            random_seed=self._np_random_seed,
+            random_seed=self.np_random_seed,
             parallel=False,
         )
 
-        """Convert Monte Carlo dict to [balloon][state][timestep]."""
+        # Convert Monte Carlo dict to [balloon][state][timestep].
         east0, north0, up0 = pm.geodetic2enu(
             monte_carlo_results_["lat0"],
             monte_carlo_results_["lon0"],
@@ -640,6 +745,24 @@ class BalloonPoppingEnv(gym.Env):
         shifted = np.where(pre_release_mask_expanded, initial_states, shifted)
 
         self._balloon_flights = shifted
+
+    def __generate_static_balloon_flights(self):
+        """Scenario 0: balloons sit at fixed heights, so no Monte Carlo is run.
+
+        Builds the [balloon, state, timestep] array directly: x, y and all
+        velocities stay 0; z is a per-balloon constant spaced 40 m apart.
+        """
+        num_balloons = self.balloon_parameters["num"]
+        num_timesteps = len(
+            np.arange(
+                0,
+                self.simulation_parameters["max_time"],
+                self.simulation_parameters["time_step"],
+            )
+        )
+        self._balloon_flights = np.zeros((num_balloons, 6, num_timesteps))
+        z_values = 10 + self._rocketpy_env.elevation + np.arange(num_balloons) * 40
+        self._balloon_flights[:, 2, :] = z_values[:, None]
 
     def __get_init_rocket_states(self, inclination, heading):
         # Initialize time and state variables
